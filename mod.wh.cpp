@@ -1,9 +1,10 @@
 // ==WindhawkMod==
 // @id              macmotion
 // @name            MacMotion App Effects
-// @description     Smooth maximize plus Genie launch, minimize, and restore.
+// @description     Smooth macOS-inspired maximize, Genie launch, minimize, and restore animations.
 // @version         1.9.4
 // @author          Aayush
+// @github          https://github.com/Aayushjoshi12
 // @include         *
 // @exclude         TextInputHost.exe
 // @exclude         ShellExperienceHost.exe
