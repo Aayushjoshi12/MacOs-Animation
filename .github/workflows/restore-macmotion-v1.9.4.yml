@@ -20,7 +20,8 @@ jobs:
         shell: bash
         run: |
           cat macmotion_payload/v1.9.4.part1 \
-              macmotion_payload/v1.9.4.part2 \
+              macmotion_payload/v1.9.4.part2a \
+              macmotion_payload/v1.9.4.part2b \
               macmotion_payload/v1.9.4.part3 \
               macmotion_payload/v1.9.4.part4 \
               macmotion_payload/v1.9.4.part5 \
