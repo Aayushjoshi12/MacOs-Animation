@@ -2,7 +2,7 @@
 // @id              macmotion
 // @name            MacMotion App Effects
 // @description     Smooth maximize plus Genie launch, minimize, and restore.
-// @version         1.9.0
+// @version         1.9.4
 // @author          Aayush
 // @include         *
 // @exclude         TextInputHost.exe
@@ -224,6 +224,8 @@ static bool IsAppMainWindow(HWND hWnd, bool forSwitch);
 static bool IsAnimating(HWND hWnd);
 static void UpdateDwmTransitions(HWND hWnd, BOOL enable);
 static void SetWindowCloak(HWND hWnd, BOOL cloak);
+static bool PrepareVisibleLaunchAnim(HWND hWnd, LONG_PTR* origExOut);
+static void CommitLaunchAnim(HWND hWnd, LONG_PTR originalExStyle);
 DWORD WINAPI NativeAltTabCommitThread(LPVOID parameter);
 struct SnapCache { HBITMAP hBmp; void* pBits; int w, h; };
 struct ShatterBlock { int srcX, srcY; float dirX, dirY, force, noiseX, noiseY; int bw = 0, bh = 0; };
@@ -282,6 +284,7 @@ std::mutex g_StateMutex;
 
 std::atomic<HWINEVENTHOOK> g_hForegroundHook{NULL};
 std::atomic<HWINEVENTHOOK> g_hSystemSwitchHook{NULL};
+std::atomic<HWINEVENTHOOK> g_hObjectShowHook{NULL};
 using XamlAltTabViewHost_Show_t = HRESULT(WINAPI*)(void*, void*, int, void*);
 XamlAltTabViewHost_Show_t g_XamlAltTabViewHost_Show_Original = nullptr;
 std::atomic<bool> g_nativeAltTabHookInstalled{false};
@@ -295,11 +298,11 @@ std::atomic<bool> g_winEventThreadStarted{false};
 DWORD WINAPI WinEventHookThread(LPVOID lpParam);
 struct alignas(8) SharedAnimState {
     volatile LONG lastAltTabTick;
-    volatile LONG altTabSourceWindow;
+    PVOID volatile altTabSourceWindow;
     volatile LONG altTabStartTick;
     volatile LONG altTabGeneration;
 };
-static constexpr PCWSTR kSharedStateName = L"Local\\MacMotion_AppEffects_State_V1";
+static constexpr PCWSTR kSharedStateName = L"Local\\MacMotion_AppEffects_State_V2";
 HANDLE g_hMapFile = NULL;
 SharedAnimState* g_pSharedState = nullptr;
 bool g_sharedStateWritable = false;
@@ -328,19 +331,36 @@ template <typename T> static T Clamp(T value, T min, T max) {
 static bool StartWorkerThread(LPTHREAD_START_ROUTINE proc, void* param) {
     std::lock_guard<std::mutex> lock(g_WorkerThreadsMutex);
     if (g_unloading.load(std::memory_order_relaxed)) return false;
-    for (size_t i = g_WorkerThreads.size(); i-- > 0;) {
-        if (WaitForSingleObject(g_WorkerThreads[i], 0) == WAIT_OBJECT_0) {
-            CloseHandle(g_WorkerThreads[i]);
-            g_WorkerThreads.erase(g_WorkerThreads.begin() + i);
+
+    // Compact completed workers in one pass. Repeated vector::erase calls move
+    // the tail on every deletion and become unnecessarily expensive when many
+    // short-lived animation/UIA workers have completed.
+    size_t writeIndex = 0;
+    for (HANDLE hThread : g_WorkerThreads) {
+        if (WaitForSingleObject(hThread, 0) == WAIT_OBJECT_0) {
+            CloseHandle(hThread);
+        } else {
+            g_WorkerThreads[writeIndex++] = hThread;
         }
     }
-    try {
-        g_WorkerThreads.reserve(g_WorkerThreads.size() + 1);
-    } catch (const std::exception&) {
-        return false;
+    g_WorkerThreads.resize(writeIndex);
+
+    // Grow geometrically instead of reserve(size + 1), which can force a heap
+    // reallocation on almost every worker creation.
+    if (g_WorkerThreads.size() == g_WorkerThreads.capacity()) {
+        const size_t oldCapacity = g_WorkerThreads.capacity();
+        const size_t newCapacity = oldCapacity ? oldCapacity * 2 : 8;
+        try {
+            g_WorkerThreads.reserve(newCapacity);
+        } catch (const std::exception&) {
+            return false;
+        }
     }
+
     HANDLE hThread = CreateThread(NULL, 0, proc, param, 0, NULL);
     if (!hThread) return false;
+
+    // Capacity was guaranteed above, so this push doesn't need to allocate.
     g_WorkerThreads.push_back(hThread);
     return true;
 }
@@ -356,9 +376,6 @@ static void JoinWorkerThreads() {
     }
     for (HANDLE h : threads) CloseHandle(h);
 }
-static LONG HwndToShared(HWND hWnd) {
-    return (LONG)(LONG_PTR)hWnd;
-}
 static LONG NonZeroTick() {
     const LONG tick = (LONG)GetTickCount();
     return tick ? tick : 1;
@@ -366,14 +383,14 @@ static LONG NonZeroTick() {
 static void ResetAltTabState() {
     if (!g_pSharedState || !g_sharedStateWritable) return;
     InterlockedExchange(&g_pSharedState->lastAltTabTick, 0);
-    InterlockedExchange(&g_pSharedState->altTabSourceWindow, 0);
+    InterlockedExchangePointer(&g_pSharedState->altTabSourceWindow, nullptr);
     InterlockedExchange(&g_pSharedState->altTabStartTick, 0);
     InterlockedExchange(&g_pSharedState->altTabGeneration, 0);
 }
 static void BeginAltTabSession(HWND source) {
     if (!g_pSharedState || !g_sharedStateWritable) return;
     InterlockedExchange(&g_pSharedState->lastAltTabTick, 0);
-    InterlockedExchange(&g_pSharedState->altTabSourceWindow, HwndToShared(source));
+    InterlockedExchangePointer(&g_pSharedState->altTabSourceWindow, source);
     InterlockedExchange(&g_pSharedState->altTabStartTick, (LONG)GetTickCount());
     LONG generation = InterlockedIncrement(&g_pSharedState->altTabGeneration);
     if (generation == 0) InterlockedIncrement(&g_pSharedState->altTabGeneration);
@@ -444,8 +461,8 @@ HRESULT WINAPI XamlAltTabViewHost_Show_Hook(
     HRESULT result = g_XamlAltTabViewHost_Show_Original(
         pThis, immersiveMonitor, flags, applicationView);
 
-    auto* request = new NativeAltTabCommitData{source, generation};
-    if (!StartWorkerThread(NativeAltTabCommitThread, request)) {
+    auto* request = new (std::nothrow) NativeAltTabCommitData{source, generation};
+    if (!request || !StartWorkerThread(NativeAltTabCommitThread, request)) {
         delete request;
         Wh_Log(L"Native Alt+Tab commit watcher could not start");
     }
@@ -493,7 +510,9 @@ static bool ConsumeAltTabIntent(HWND target, DWORD eventTime) {
         return false;
     }
 
-    const LONG source = g_pSharedState->altTabSourceWindow;
+    HWND source = reinterpret_cast<HWND>(
+        InterlockedCompareExchangePointer(
+            &g_pSharedState->altTabSourceWindow, nullptr, nullptr));
     if (generation != g_pSharedState->altTabGeneration) return false;
     LONG consumed = g_consumedGeneration.load(std::memory_order_relaxed);
     if (consumed == generation ||
@@ -501,13 +520,16 @@ static bool ConsumeAltTabIntent(HWND target, DWORD eventTime) {
         return false;
     }
 
-    return !source || source != HwndToShared(target);
+    return !source || source != target;
 }
 static bool IsExplorerProcess() {
-    WCHAR path[MAX_PATH]{};
-    if (!GetModuleFileNameW(NULL, path, ARRAYSIZE(path))) return false;
-    const WCHAR* name = wcsrchr(path, L'\\');
-    return _wcsicmp(name ? name + 1 : path, L"explorer.exe") == 0;
+    static const bool isExplorer = []() {
+        WCHAR path[MAX_PATH]{};
+        if (!GetModuleFileNameW(NULL, path, ARRAYSIZE(path))) return false;
+        const WCHAR* name = wcsrchr(path, L'\\');
+        return _wcsicmp(name ? name + 1 : path, L"explorer.exe") == 0;
+    }();
+    return isExplorer;
 }
 static std::wstring GetClassNameStr(HWND hWnd) {
     WCHAR name[256];
@@ -533,12 +555,20 @@ static bool IsAnimating(HWND hWnd) {
 }
 static void CleanupWindowData(HWND hWnd) {
     std::lock_guard<std::mutex> lock(g_StateMutex);
+
     auto it = g_WndSnapshots.find(hWnd);
-    if (it != g_WndSnapshots.end()) { DeleteObject(it->second.hBmp); g_WndSnapshots.erase(it); }
-    g_TaskbarDockXs.clear();
-    g_ProcessDockXs.clear();
+    if (it != g_WndSnapshots.end()) {
+        DeleteObject(it->second.hBmp);
+        g_WndSnapshots.erase(it);
+    }
+
+    // Only invalidate state belonging to this window. Clearing the complete
+    // taskbar/process caches here caused unrelated windows to repeat expensive
+    // UI Automation lookups after any window was destroyed.
+    g_TaskbarDockXs.erase(hWnd);
     g_ProcessNameCache.erase(hWnd);
     g_LaunchSeen.erase(hWnd);
+    g_AnimActive.erase(hWnd);
 }
 
 static void SweepStaleData() {
@@ -703,10 +733,18 @@ std::wstring GetProcessNameCached(HWND hWnd) {
 void EnsureWinEventThreadStarted() {
     if (g_winEventThreadStarted.load(std::memory_order_relaxed)) return;
     if (g_unloading.load(std::memory_order_relaxed)) return;
-    if (!g_switchAnimation.load(std::memory_order_relaxed)) return;
+
+    const bool needEvents =
+        g_switchAnimation.load(std::memory_order_relaxed) ||
+        g_launchAnimation.load(std::memory_order_relaxed);
+    if (!needEvents) return;
+
     std::lock_guard<std::mutex> lock(g_StateMutex);
     if (g_unloading.load(std::memory_order_relaxed)) return;
-    if (!g_switchAnimation.load(std::memory_order_relaxed)) return;
+    if (!g_switchAnimation.load(std::memory_order_relaxed) &&
+        !g_launchAnimation.load(std::memory_order_relaxed)) {
+        return;
+    }
     if (g_hWinEventThread || g_winEventThreadStarted.load(std::memory_order_relaxed)) return;
     HANDLE hThread = CreateThread(NULL, 0, WinEventHookThread, NULL, 0, NULL);
     if (!hThread) return;
@@ -740,10 +778,26 @@ static bool ShouldAnimateWindow(HWND hWnd) {
     return r.right - r.left >= 40 && r.bottom - r.top >= 40;
 }
 static bool IsLaunchWindow(HWND hWnd) {
-    if (!hWnd || GetAncestor(hWnd, GA_ROOT) != hWnd) return false;
+    if (!hWnd || !IsWindow(hWnd) || GetAncestor(hWnd, GA_ROOT) != hWnd) return false;
+
     const LONG_PTR style = GetWindowLongPtrW(hWnd, GWL_STYLE);
     const LONG_PTR exStyle = GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
-    return (style & WS_CAPTION) && !(exStyle & WS_EX_TOOLWINDOW) && ShouldAnimateWindow(hWnd);
+
+    if (style & WS_CHILD) return false;
+    if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return false;
+    if (GetWindow(hWnd, GW_OWNER)) return false;
+
+    const auto cls = GetClassNameStr(hWnd);
+    if (ContainsClass(cls, kAlwaysExcludedClasses)) return false;
+
+    RECT r{};
+    if (!GetWindowRect(hWnd, &r)) return false;
+    const int width = r.right - r.left;
+    const int height = r.bottom - r.top;
+
+    // Avoid tiny helper/message windows while allowing modern custom-framed
+    // applications which don't expose WS_CAPTION.
+    return width >= 160 && height >= 100;
 }
 HWND FindTaskbarForMonitor(HMONITOR hMon) {
     HWND hMainTray = FindWindowW(L"Shell_TrayWnd", NULL);
@@ -918,10 +972,16 @@ int GetTaskbarButtonX_Async(HWND hWndApp, const WCHAR* windowTitle, int fallback
             }
         }
     }
+    // A taskbar position normally stays stable for the lifetime of the window
+    // (and the process/monitor cache covers recreated windows). Avoid spawning a
+    // COM/UIA worker and synchronously waiting when we already have a good match.
+    if (haveCache) return cachedX;
+
     std::wstring titleLower = windowTitle ? windowTitle : L"";
     std::transform(titleLower.begin(), titleLower.end(), titleLower.begin(), ::towlower);
 
-    auto* pending = new UiaPending{};
+    auto* pending = new (std::nothrow) UiaPending{};
+    if (!pending) return haveCache ? cachedX : fallbackX;
     pending->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     pending->targetX = haveCache ? cachedX : fallbackX;
     if (!pending->done) {
@@ -930,8 +990,9 @@ int GetTaskbarButtonX_Async(HWND hWndApp, const WCHAR* windowTitle, int fallback
         return haveCache ? cachedX : fallbackX;
     }
 
-    auto* task = new UiaTask{hWndApp, titleLower, procNameLower, processKey, hMon, fallbackX, pending};
-    if (!StartWorkerThread(UiaWorkerThread, task)) {
+    auto* task = new (std::nothrow) UiaTask{
+        hWndApp, titleLower, procNameLower, processKey, hMon, fallbackX, pending};
+    if (!task || !StartWorkerThread(UiaWorkerThread, task)) {
         delete task;
         pending->Release();
         pending->Release();
@@ -1219,6 +1280,32 @@ DWORD WINAPI NativeAltTabCommitThread(LPVOID parameter) {
     }
     return 0;
 }
+void CALLBACK LaunchShowEventProc(HWINEVENTHOOK hWinEventHook, DWORD event,
+                                  HWND hWnd, LONG idObject, LONG idChild,
+                                  DWORD dwEventThread, DWORD dwmsEventTime) {
+    if (event != EVENT_OBJECT_SHOW || idObject != OBJID_WINDOW ||
+        idChild != CHILDID_SELF || !hWnd) {
+        return;
+    }
+    if (g_unloading.load(std::memory_order_relaxed) ||
+        !g_launchAnimation.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(hWnd) ||
+        IsIconic(hWnd)) {
+        return;
+    }
+
+    LONG_PTR originalStyle = 0;
+    if (PrepareVisibleLaunchAnim(hWnd, &originalStyle)) {
+        Wh_Log(L"Launch fallback detected visible window hwnd=%p", hWnd);
+        CommitLaunchAnim(hWnd, originalStyle);
+    }
+}
+
 void CALLBACK SystemSwitchEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hWnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
     if (!g_switchAnimation.load(std::memory_order_relaxed) ||
         g_nativeAltTabHookInstalled.load(std::memory_order_acquire) ||
@@ -1235,22 +1322,51 @@ void CALLBACK SystemSwitchEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HW
     }
 }
 DWORD WINAPI WinEventHookThread(LPVOID lpParam) {
-    DWORD foregroundProcessId =
-        IsExplorerProcess() &&
-                g_nativeAltTabHookInstalled.load(std::memory_order_acquire)
-            ? 0
-            : GetCurrentProcessId();
-    HWINEVENTHOOK hook = SetWinEventHook(
-        EVENT_SYSTEM_FOREGROUND,
-        EVENT_SYSTEM_FOREGROUND,
-        NULL,
-        ForegroundEventProc,
-        foregroundProcessId, 0,
-        WINEVENT_OUTOFCONTEXT);
-    g_hForegroundHook.store(hook, std::memory_order_release);
+    HWINEVENTHOOK foregroundHook = NULL;
+
+    // Alt+Tab animation is intentionally disabled in the current build, so
+    // don't subscribe every injected process to foreground changes unless that
+    // feature is explicitly active in a future build.
+    if (g_switchAnimation.load(std::memory_order_relaxed)) {
+        DWORD foregroundProcessId =
+            IsExplorerProcess() &&
+                    g_nativeAltTabHookInstalled.load(std::memory_order_acquire)
+                ? 0
+                : GetCurrentProcessId();
+
+        foregroundHook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            NULL,
+            ForegroundEventProc,
+            foregroundProcessId, 0,
+            WINEVENT_OUTOFCONTEXT);
+        g_hForegroundHook.store(foregroundHook, std::memory_order_release);
+
+        if (!foregroundHook) {
+            Wh_Log(L"Foreground event listener unavailable error=%lu",
+                   GetLastError());
+        }
+    }
+
+    HWINEVENTHOOK objectShowHook = NULL;
+    if (g_launchAnimation.load(std::memory_order_relaxed)) {
+        objectShowHook = SetWinEventHook(
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_SHOW,
+            NULL,
+            LaunchShowEventProc,
+            GetCurrentProcessId(), 0,
+            WINEVENT_OUTOFCONTEXT);
+        g_hObjectShowHook.store(objectShowHook, std::memory_order_release);
+        if (!objectShowHook) {
+            Wh_Log(L"Launch show-event listener unavailable error=%lu", GetLastError());
+        }
+    }
 
     HWINEVENTHOOK systemSwitchHook = NULL;
-    if (IsExplorerProcess()) {
+    if (g_switchAnimation.load(std::memory_order_relaxed) &&
+        IsExplorerProcess()) {
         systemSwitchHook = SetWinEventHook(
             EVENT_SYSTEM_SWITCHSTART,
             EVENT_SYSTEM_SWITCHEND,
@@ -1266,8 +1382,14 @@ DWORD WINAPI WinEventHookThread(LPVOID lpParam) {
         }
     }
         
-    MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) {
+    MSG msg{};
+    for (;;) {
+        const BOOL getMessageResult = GetMessageW(&msg, NULL, 0, 0);
+        if (getMessageResult == 0) break;
+        if (getMessageResult == -1) {
+            Wh_Log(L"WinEvent message loop failed error=%lu", GetLastError());
+            break;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -1276,6 +1398,9 @@ DWORD WINAPI WinEventHookThread(LPVOID lpParam) {
         UnhookWinEvent(oldHook);
     }
     if (HWINEVENTHOOK oldHook = g_hSystemSwitchHook.exchange(NULL, std::memory_order_acquire)) {
+        UnhookWinEvent(oldHook);
+    }
+    if (HWINEVENTHOOK oldHook = g_hObjectShowHook.exchange(NULL, std::memory_order_acquire)) {
         UnhookWinEvent(oldHook);
     }
     return 0;
@@ -1983,8 +2108,10 @@ DWORD WINAPI MainAnimThread(LPVOID lpParam) {
 }
 bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloakHidden = FALSE, BOOL isClosing = FALSE, UINT closeMsg = 0, HANDLE hWaitFinish = NULL) {
     
-    static std::atomic<int> s_animCount{0};
-    if (s_animCount.fetch_add(1, std::memory_order_relaxed) % 10 == 0) {
+    static std::atomic<unsigned> s_animCount{0};
+    const unsigned animationNumber =
+        s_animCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((animationNumber & 0x0Fu) == 0) {
         SweepStaleData();
     }
 
@@ -2028,11 +2155,14 @@ bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloak
     }
     
     if (g_unloading.load(std::memory_order_relaxed)) {
-        if (rising) UndoRisingHide(hWnd, originalExStyle, cloakHidden);
-        else {
-            bool owned;
-            { std::lock_guard<std::mutex> lock(g_StateMutex); owned = g_AnimActive.count(hWnd) != 0; }
-            if (!owned) UpdateDwmTransitions(hWnd, TRUE);
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            g_AnimActive.erase(hWnd);
+        }
+        if (rising) {
+            UndoRisingHide(hWnd, originalExStyle, cloakHidden);
+        } else {
+            UpdateDwmTransitions(hWnd, TRUE);
         }
         return false;
     }
@@ -2041,33 +2171,77 @@ bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloak
     if (!GetMonitorInfoW(hMon, &mi)) {
         mi.rcMonitor.left = 0; mi.rcMonitor.top = 0; mi.rcMonitor.right = GetSystemMetrics(SM_CXSCREEN); mi.rcMonitor.bottom = GetSystemMetrics(SM_CYSCREEN);
     }
-    int monWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-    DWORD alignVal = 1, dataSize = sizeof(alignVal);
-    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", L"TaskbarAl", RRF_RT_REG_DWORD, NULL, &alignVal, &dataSize);
-    int learnedTargetX = (alignVal == 0) ? (mi.rcMonitor.left + 160) : (mi.rcMonitor.left + monWidth / 2);
-    POINT pt; GetCursorPos(&pt);
-    RECT workArea; MONITORINFO cursorMi; cursorMi.cbSize = sizeof(cursorMi);
-    if (GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &cursorMi)) workArea = cursorMi.rcWork;
-    else SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-    if (!PtInRect(&workArea, pt)) {
-        learnedTargetX = pt.x;
-        std::lock_guard<std::mutex> lock(g_StateMutex);
-        g_TaskbarDockXs[hWnd] = learnedTargetX;
-    } else if (!isClosing && g_minRestoreEffectStyle.load(std::memory_order_relaxed) == 0) {
-        WCHAR windowTitle[256] = {0};
-        GetWindowTextW(hWnd, windowTitle, 256);
-        learnedTargetX = GetTaskbarButtonX_Async(hWnd, windowTitle, learnedTargetX, hMon);
+    const int monWidth = mi.rcMonitor.right - mi.rcMonitor.left;
+    int learnedTargetX = mi.rcMonitor.left + monWidth / 2;
+
+    // Only Genie needs a taskbar destination. Ink Splash and close effects don't
+    // consume targetDockX, so skip registry/cursor/UIA work for those paths.
+    if (!isClosing &&
+        g_minRestoreEffectStyle.load(std::memory_order_relaxed) == 0) {
+        DWORD alignVal = 1;
+        DWORD dataSize = sizeof(alignVal);
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+            L"TaskbarAl", RRF_RT_REG_DWORD, NULL, &alignVal, &dataSize);
+
+        learnedTargetX =
+            (alignVal == 0)
+                ? (mi.rcMonitor.left + 160)
+                : (mi.rcMonitor.left + monWidth / 2);
+
+        POINT pt{};
+        GetCursorPos(&pt);
+
+        RECT workArea{};
+        MONITORINFO cursorMi{};
+        cursorMi.cbSize = sizeof(cursorMi);
+
+        if (GetMonitorInfoW(
+                MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST),
+                &cursorMi)) {
+            workArea = cursorMi.rcWork;
+        } else {
+            SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, &workArea, 0);
+        }
+
+        if (!PtInRect(&workArea, pt)) {
+            learnedTargetX = pt.x;
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            g_TaskbarDockXs[hWnd] = learnedTargetX;
+        } else {
+            WCHAR windowTitle[256] = {};
+            GetWindowTextW(
+                hWnd, windowTitle, ARRAYSIZE(windowTitle));
+            learnedTargetX = GetTaskbarButtonX_Async(
+                hWnd, windowTitle, learnedTargetX, hMon);
+        }
     }
     int durationMs = isClosing ? g_closeDurationMs.load(std::memory_order_relaxed)
                                : g_durationMs.load(std::memory_order_relaxed);
     if (!isClosing && g_minRestoreEffectStyle.load(std::memory_order_relaxed) == 1) {
         durationMs = Clamp((durationMs * 6) / 5, 260, 1400);
     }
-    auto* data = new WindowAnimData{
-        hWnd, nullptr, nullptr, rect, hMon, w, h, learnedTargetX, rising, originalExStyle, cloakHidden, nullptr,
-        durationMs,
-        isClosing, closeMsg, hWaitFinish
+    auto* data = new (std::nothrow) WindowAnimData{
+        hWnd, nullptr, nullptr, rect, hMon, w, h, learnedTargetX, rising,
+        originalExStyle, cloakHidden, nullptr, durationMs, isClosing, closeMsg,
+        hWaitFinish
     };
+    if (!data) {
+        Wh_Log(L"Animation data allocation failed hwnd=%p", hWnd);
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            g_AnimActive.erase(hWnd);
+        }
+        if (rising) {
+            UndoRisingHide(hWnd, originalExStyle, cloakHidden);
+        } else {
+            UpdateDwmTransitions(hWnd, TRUE);
+        }
+        return false;
+    }
+
     HDC hScreenDC = GetDC(NULL);
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bmi.bmiHeader.biWidth = w; bmi.bmiHeader.biHeight = -h;
@@ -2125,43 +2299,113 @@ bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloak
             return false;
         }
         HBITMAP oldBmp = (HBITMAP)SelectObject(tempDC, tempBmp);
-        if (forceOpaque)
-            BitBlt(tempDC, 0, 0, rawW, rawH, hScreenDC, winRect.left, winRect.top, SRCCOPY);
-        else PrintWindow(hWnd, tempDC, PW_RENDERFULLCONTENT);
-        GdiFlush();
-        CopySnapshot(tempBits);
+        if (!oldBmp || oldBmp == HGDI_ERROR) {
+            DeleteObject(tempBmp);
+            DeleteDC(tempDC);
+            return false;
+        }
+
+        BOOL captured = FALSE;
+        if (forceOpaque) {
+            captured = BitBlt(
+                tempDC, 0, 0, rawW, rawH,
+                hScreenDC, winRect.left, winRect.top, SRCCOPY);
+        } else {
+            captured = PrintWindow(hWnd, tempDC, PW_RENDERFULLCONTENT);
+
+            // Screen-copy fallback is valid only while the real window is still
+            // visible. During launch/restore the real window can be alpha=0 or
+            // DWM-cloaked, so BitBlt would capture whatever is behind it.
+            if (!captured && !rising) {
+                captured = BitBlt(
+                    tempDC, 0, 0, rawW, rawH,
+                    hScreenDC, winRect.left, winRect.top, SRCCOPY);
+            }
+        }
+
+        if (captured) {
+            GdiFlush();
+            CopySnapshot(tempBits);
+        }
+
         SelectObject(tempDC, oldBmp);
         DeleteObject(tempBmp);
         DeleteDC(tempDC);
-        return true;
+        return captured != FALSE;
     };
+    bool snapshotReady = false;
+
     if (rising) {
-        BOOL fromCache = FALSE;
         {
             std::lock_guard<std::mutex> lock(g_StateMutex);
             auto it = g_WndSnapshots.find(hWnd);
             if (it != g_WndSnapshots.end()) {
                 SnapCache& c = it->second;
-                if (c.w == w && c.h == h) { memcpy(data->pBits, c.pBits, (size_t)w * h * 4); fromCache = TRUE; }
-                DeleteObject(c.hBmp); g_WndSnapshots.erase(it);
+                if (c.w == w && c.h == h) {
+                    memcpy(
+                        data->pBits, c.pBits,
+                        (size_t)w * (size_t)h * 4);
+                    snapshotReady = true;
+                }
+                DeleteObject(c.hBmp);
+                g_WndSnapshots.erase(it);
             }
         }
-        if (!fromCache) CaptureNow();
+
+        if (!snapshotReady) {
+            snapshotReady = CaptureNow();
+        }
     } else {
-        CaptureNow();
-        if (!isClosing) {
+        snapshotReady = CaptureNow();
+
+        if (snapshotReady && !isClosing) {
             std::lock_guard<std::mutex> lock(g_StateMutex);
+
             auto it = g_WndSnapshots.find(hWnd);
-            if (it != g_WndSnapshots.end()) { DeleteObject(it->second.hBmp); g_WndSnapshots.erase(it); }
+            if (it != g_WndSnapshots.end()) {
+                DeleteObject(it->second.hBmp);
+                g_WndSnapshots.erase(it);
+            }
+
             void* pCacheBits = nullptr;
-            HBITMAP hCacheBmp = CreateDib32(hScreenDC, w, h, &pCacheBits);
+            HBITMAP hCacheBmp =
+                CreateDib32(hScreenDC, w, h, &pCacheBits);
+
             if (hCacheBmp && pCacheBits) {
-                memcpy(pCacheBits, data->pBits, (size_t)w * h * 4);
-                g_WndSnapshots[hWnd] = { hCacheBmp, pCacheBits, w, h };
-            } else if (hCacheBmp) DeleteObject(hCacheBmp);
+                memcpy(
+                    pCacheBits, data->pBits,
+                    (size_t)w * (size_t)h * 4);
+                g_WndSnapshots[hWnd] =
+                    {hCacheBmp, pCacheBits, w, h};
+            } else if (hCacheBmp) {
+                DeleteObject(hCacheBmp);
+            }
         }
     }
+
     ReleaseDC(NULL, hScreenDC);
+
+    if (!snapshotReady) {
+        Wh_Log(L"Animation snapshot unavailable hwnd=%p rising=%d closing=%d",
+               hWnd, rising, isClosing);
+
+        if (rising) {
+            UndoRisingHide(
+                hWnd, data->originalExStyle, data->hiddenByCloak);
+        } else {
+            UpdateDwmTransitions(hWnd, TRUE);
+        }
+
+        DeleteObject(data->hBitmap);
+        delete data;
+
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            g_AnimActive.erase(hWnd);
+        }
+
+        return false;
+    }
     HANDLE hFirstShown = NULL;
     if (!rising) {
         hFirstShown = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -2199,7 +2443,13 @@ static bool IsMinimizeCommand(int cmd) {
     return cmd == SW_MINIMIZE || cmd == SW_SHOWMINIMIZED || cmd == SW_SHOWMINNOACTIVE;
 }
 static bool IsLaunchCommand(int cmd) {
-    return cmd == SW_SHOW || cmd == SW_SHOWNORMAL || cmd == SW_SHOWDEFAULT || cmd == SW_SHOWMAXIMIZED;
+    return cmd == SW_SHOW ||
+           cmd == SW_SHOWNORMAL ||
+           cmd == SW_SHOWDEFAULT ||
+           cmd == SW_SHOWMAXIMIZED ||
+           cmd == SW_SHOWNA ||
+           cmd == SW_SHOWNOACTIVATE ||
+           cmd == SW_RESTORE;
 }
 static void WaitForCloseAnimation(HANDLE wait) {
     const DWORD timeoutMs = (DWORD)std::max(AnimConstants::WaitTimeoutMs,
@@ -2245,32 +2495,83 @@ static void TryMinimizeAnim(HWND hWnd) {
     UpdateDwmTransitions(hWnd, FALSE);
     StartAnimation(hWnd, FALSE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE));
 }
-static bool PrepareLaunchAnim(HWND hWnd, int nCmdShow, LONG_PTR* origExOut) {
-    if (g_unloading.load(std::memory_order_relaxed)) return false;
-    if (!g_launchAnimation.load(std::memory_order_relaxed)) return false;
-    if (!IsLaunchCommand(nCmdShow)) return false;
-    if (IsWindowVisible(hWnd) || IsIconic(hWnd)) return false;
-    if (!IsLaunchWindow(hWnd)) return false;
-    LONG_PTR exStyle = GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
-    if (exStyle & WS_EX_LAYERED) return false;
-    { std::lock_guard<std::mutex> lock(g_StateMutex); if (!g_LaunchSeen.insert(hWnd).second) return false; }
-    UpdateDwmTransitions(hWnd, FALSE);
-    *origExOut = exStyle;
-    SetWindowLongPtrW(hWnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
-    SetLayeredWindowAttributes(hWnd, 0, 0, LWA_ALPHA);
-    return true;
+static void ForgetLaunchSeen(HWND hWnd) {
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    g_LaunchSeen.erase(hWnd);
 }
-static void CommitLaunchAnim(HWND hWnd, LONG_PTR originalExStyle) {
-    auto* ld = new LaunchAnimData{hWnd, originalExStyle};
-    if (!StartWorkerThread(LaunchAnimThread, ld)) {
-        delete ld;
+
+static void RestorePreparedLaunchWindow(HWND hWnd, LONG_PTR originalExStyle,
+                                        bool forgetLaunch) {
+    if (IsWindow(hWnd)) {
         SetLayeredWindowAttributes(hWnd, 0, 255, LWA_ALPHA);
         if (!(originalExStyle & WS_EX_LAYERED)) {
-            SetWindowLongPtrW(hWnd, GWL_EXSTYLE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+            SetWindowLongPtrW(
+                hWnd, GWL_EXSTYLE,
+                GetWindowLongPtrW(hWnd, GWL_EXSTYLE) & ~WS_EX_LAYERED);
         }
         UpdateDwmTransitions(hWnd, TRUE);
     }
+    if (forgetLaunch) ForgetLaunchSeen(hWnd);
 }
+
+static bool PrepareLaunchAnimCommon(HWND hWnd, LONG_PTR* origExOut,
+                                    bool requireAlreadyVisible) {
+    if (!origExOut || g_unloading.load(std::memory_order_relaxed)) return false;
+    if (!g_launchAnimation.load(std::memory_order_relaxed)) return false;
+    if (IsIconic(hWnd) || !IsLaunchWindow(hWnd)) return false;
+
+    const bool visible = IsWindowVisible(hWnd) != FALSE;
+    if (requireAlreadyVisible != visible) return false;
+
+    LONG_PTR exStyle = GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_LAYERED) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        if (!g_LaunchSeen.insert(hWnd).second) return false;
+    }
+
+    UpdateDwmTransitions(hWnd, FALSE);
+    *origExOut = exStyle;
+
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previous =
+        SetWindowLongPtrW(hWnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
+    if (previous == 0 && GetLastError() != ERROR_SUCCESS) {
+        UpdateDwmTransitions(hWnd, TRUE);
+        ForgetLaunchSeen(hWnd);
+        return false;
+    }
+
+    if (!SetLayeredWindowAttributes(hWnd, 0, 0, LWA_ALPHA)) {
+        if (!(exStyle & WS_EX_LAYERED)) {
+            SetWindowLongPtrW(hWnd, GWL_EXSTYLE, exStyle);
+        }
+        UpdateDwmTransitions(hWnd, TRUE);
+        ForgetLaunchSeen(hWnd);
+        return false;
+    }
+
+    return true;
+}
+
+static bool PrepareLaunchAnim(HWND hWnd, int nCmdShow, LONG_PTR* origExOut) {
+    if (!IsLaunchCommand(nCmdShow)) return false;
+    return PrepareLaunchAnimCommon(hWnd, origExOut, false);
+}
+
+static bool PrepareVisibleLaunchAnim(HWND hWnd, LONG_PTR* origExOut) {
+    return PrepareLaunchAnimCommon(hWnd, origExOut, true);
+}
+
+static void CommitLaunchAnim(HWND hWnd, LONG_PTR originalExStyle) {
+    auto* ld = new (std::nothrow) LaunchAnimData{hWnd, originalExStyle};
+    if (!ld || !StartWorkerThread(LaunchAnimThread, ld)) {
+        delete ld;
+        RestorePreparedLaunchWindow(hWnd, originalExStyle, true);
+    }
+}
+
 static bool IsOurWindow(HWND hWnd) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hWnd, &pid);
@@ -2417,51 +2718,74 @@ static void CommitResizeAnimation(ResizeAnimData* data, PCWSTR kind) {
 }
 BOOL WINAPI ShowWindow_Hook(HWND hWnd, int cmd) {
     if (!IsOurWindow(hWnd)) return ShowWindow_Original(hWnd, cmd);
-    if (cmd == SW_SHOW || cmd == SW_SHOWNORMAL || cmd == SW_SHOWMAXIMIZED || cmd == SW_RESTORE || 
-        cmd == SW_SHOWDEFAULT || cmd == SW_SHOWMINIMIZED || cmd == SW_SHOWMINNOACTIVE || 
+
+    if (cmd == SW_SHOW || cmd == SW_SHOWNORMAL || cmd == SW_SHOWMAXIMIZED ||
+        cmd == SW_RESTORE || cmd == SW_SHOWDEFAULT ||
+        cmd == SW_SHOWMINIMIZED || cmd == SW_SHOWMINNOACTIVE ||
         cmd == SW_SHOWNA || cmd == SW_SHOWNOACTIVATE) {
         EnsureWinEventThreadStarted();
     }
+
     if (cmd == SW_HIDE) {
-        if (GetPropW(hWnd, kPropCloseBypass)) return ShowWindow_Original(hWnd, cmd);
+        if (GetPropW(hWnd, kPropCloseBypass))
+            return ShowWindow_Original(hWnd, cmd);
+
         if (ShouldTreatHideAsClose(hWnd)) {
             BOOL wasVisible = IsWindowVisible(hWnd);
-            if (RunCloseAnimation(hWnd, ANIM_DEFER_SW_HIDE)) return wasVisible;
+            if (RunCloseAnimation(hWnd, ANIM_DEFER_SW_HIDE))
+                return wasVisible;
         }
     }
-    const bool maximize = cmd == SW_SHOWMAXIMIZED && !IsZoomed(hWnd) &&
-                          !IsIconic(hWnd);
-    const bool unmaximize = (cmd == SW_RESTORE || cmd == SW_SHOWNORMAL) &&
-                            IsZoomed(hWnd);
-    if (maximize || unmaximize) {
-        ResizeAnimData* resize = PrepareResizeAnimation(hWnd);
-        BOOL result = ShowWindow_Original(hWnd, cmd);
-        CommitResizeAnimation(resize, maximize ? L"maximize" : L"unmaximize");
-        return result;
-    }
+
     if (IsMinimizeCommand(cmd)) {
-        if (g_minimizeAnimation.load(std::memory_order_relaxed) && ShouldAnimateWindow(hWnd)) {
+        if (g_minimizeAnimation.load(std::memory_order_relaxed) &&
+            ShouldAnimateWindow(hWnd)) {
             UpdateDwmTransitions(hWnd, FALSE);
-            StartAnimation(hWnd, FALSE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE));
+            StartAnimation(
+                hWnd, FALSE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE));
         }
         return ShowWindow_Original(hWnd, cmd);
     }
+
     if ((cmd == SW_RESTORE || cmd == SW_SHOWNORMAL) && IsIconic(hWnd)) {
-        if (g_restoreAnimation.load(std::memory_order_relaxed) && ShouldAnimateWindow(hWnd)) {
+        if (g_restoreAnimation.load(std::memory_order_relaxed) &&
+            ShouldAnimateWindow(hWnd)) {
             UpdateDwmTransitions(hWnd, FALSE);
             SetWindowCloak(hWnd, TRUE);
             BOOL result = ShowWindow_Original(hWnd, cmd);
-            StartAnimation(hWnd, TRUE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE), TRUE);
+            if (!StartAnimation(
+                    hWnd, TRUE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE), TRUE)) {
+                SetWindowCloak(hWnd, FALSE);
+                UpdateDwmTransitions(hWnd, TRUE);
+            }
             return result;
         }
         return ShowWindow_Original(hWnd, cmd);
     }
-    LONG_PTR originalStyle;
+
+    // IMPORTANT: Detect a hidden first-show before treating SW_SHOWMAXIMIZED as
+    // a normal maximize. Previously a freshly launched maximized app skipped
+    // the Genie path completely.
+    LONG_PTR originalStyle = 0;
     if (PrepareLaunchAnim(hWnd, cmd, &originalStyle)) {
         BOOL result = ShowWindow_Original(hWnd, cmd);
         CommitLaunchAnim(hWnd, originalStyle);
         return result;
     }
+
+    const bool maximize =
+        cmd == SW_SHOWMAXIMIZED && !IsZoomed(hWnd) && !IsIconic(hWnd);
+    const bool unmaximize =
+        (cmd == SW_RESTORE || cmd == SW_SHOWNORMAL) && IsZoomed(hWnd);
+
+    if (maximize || unmaximize) {
+        ResizeAnimData* resize = PrepareResizeAnimation(hWnd);
+        BOOL result = ShowWindow_Original(hWnd, cmd);
+        CommitResizeAnimation(
+            resize, maximize ? L"maximize" : L"unmaximize");
+        return result;
+    }
+
     return ShowWindow_Original(hWnd, cmd);
 }
 BOOL WINAPI ShowWindowAsync_Hook(HWND hWnd, int cmd) {
@@ -2582,36 +2906,79 @@ LRESULT WINAPI DefWindowProcW_Hook(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
     }
     return DefWindowProcW_Original(hWnd, msg, wParam, lParam);
 }
-BOOL WINAPI SetWindowPlacement_Hook(HWND hWnd, const WINDOWPLACEMENT* placement) {
-    if (!IsOurWindow(hWnd)) return SetWindowPlacement_Original(hWnd, placement);
-    if (placement) {
-        const bool maximize = placement->showCmd == SW_SHOWMAXIMIZED &&
-                              !IsZoomed(hWnd) && !IsIconic(hWnd);
-        const bool unmaximize = (placement->showCmd == SW_RESTORE ||
-                                 placement->showCmd == SW_SHOWNORMAL) &&
-                                IsZoomed(hWnd);
-        if (maximize || unmaximize) {
-            ResizeAnimData* resize = PrepareResizeAnimation(hWnd);
-            BOOL result = SetWindowPlacement_Original(hWnd, placement);
-            CommitResizeAnimation(resize,
-                                  maximize ? L"maximize" : L"unmaximize");
-            return result;
-        }
-        if (IsMinimizeCommand(placement->showCmd)) TryMinimizeAnim(hWnd);
-        else if (placement->showCmd == SW_HIDE && !GetPropW(hWnd, kPropCloseBypass) &&
-                 ShouldTreatHideAsClose(hWnd)) {
-            
-            WINDOWPLACEMENT modified = *placement;
-            modified.showCmd = SW_SHOWNA;
-            BOOL applied = SetWindowPlacement_Original(hWnd, &modified);
-            
-            if (!applied) return FALSE;
-            
-            if (RunCloseAnimation(hWnd, ANIM_DEFER_SW_HIDE)) return TRUE;
-            
-            return ShowWindow_Original(hWnd, SW_HIDE);
-        }
+BOOL WINAPI SetWindowPlacement_Hook(
+    HWND hWnd, const WINDOWPLACEMENT* placement) {
+    if (!IsOurWindow(hWnd))
+        return SetWindowPlacement_Original(hWnd, placement);
+
+    if (!placement)
+        return SetWindowPlacement_Original(hWnd, placement);
+
+    if (IsMinimizeCommand(placement->showCmd)) {
+        TryMinimizeAnim(hWnd);
+        return SetWindowPlacement_Original(hWnd, placement);
     }
+
+    if (placement->showCmd == SW_HIDE &&
+        !GetPropW(hWnd, kPropCloseBypass) &&
+        ShouldTreatHideAsClose(hWnd)) {
+        WINDOWPLACEMENT modified = *placement;
+        modified.showCmd = SW_SHOWNA;
+
+        BOOL applied = SetWindowPlacement_Original(hWnd, &modified);
+        if (!applied) return FALSE;
+
+        if (RunCloseAnimation(hWnd, ANIM_DEFER_SW_HIDE)) return TRUE;
+
+        return ShowWindow_Original(hWnd, SW_HIDE);
+    }
+
+    if ((placement->showCmd == SW_RESTORE ||
+         placement->showCmd == SW_SHOWNORMAL) &&
+        IsIconic(hWnd) &&
+        g_restoreAnimation.load(std::memory_order_relaxed) &&
+        ShouldAnimateWindow(hWnd)) {
+        UpdateDwmTransitions(hWnd, FALSE);
+        SetWindowCloak(hWnd, TRUE);
+
+        BOOL result = SetWindowPlacement_Original(hWnd, placement);
+        if (!result ||
+            !StartAnimation(
+                hWnd, TRUE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE), TRUE)) {
+            SetWindowCloak(hWnd, FALSE);
+            UpdateDwmTransitions(hWnd, TRUE);
+        }
+        return result;
+    }
+
+    // First-show launch has to be checked before maximize/unmaximize.
+    LONG_PTR originalStyle = 0;
+    if (PrepareLaunchAnim(hWnd, placement->showCmd, &originalStyle)) {
+        BOOL result = SetWindowPlacement_Original(hWnd, placement);
+        if (result) {
+            CommitLaunchAnim(hWnd, originalStyle);
+        } else {
+            RestorePreparedLaunchWindow(hWnd, originalStyle, true);
+        }
+        return result;
+    }
+
+    const bool maximize =
+        placement->showCmd == SW_SHOWMAXIMIZED &&
+        !IsZoomed(hWnd) && !IsIconic(hWnd);
+    const bool unmaximize =
+        (placement->showCmd == SW_RESTORE ||
+         placement->showCmd == SW_SHOWNORMAL) &&
+        IsZoomed(hWnd);
+
+    if (maximize || unmaximize) {
+        ResizeAnimData* resize = PrepareResizeAnimation(hWnd);
+        BOOL result = SetWindowPlacement_Original(hWnd, placement);
+        CommitResizeAnimation(
+            resize, maximize ? L"maximize" : L"unmaximize");
+        return result;
+    }
+
     return SetWindowPlacement_Original(hWnd, placement);
 }
 BOOL WINAPI CloseWindow_Hook(HWND hWnd) {
@@ -2627,17 +2994,18 @@ DWORD WINAPI LaunchAnimThread(LPVOID lpParam) {
         if (!IsWindow(hWnd) || g_unloading.load(std::memory_order_relaxed)) break;
         UINT cloaked = 0; if (FAILED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) || !cloaked) break; Sleep(50);
     }
-    if (g_unloading.load(std::memory_order_relaxed) || !IsWindow(hWnd) || IsIconic(hWnd) || !IsWindowVisible(hWnd)) {
-        if (IsWindow(hWnd)) {
-            SetLayeredWindowAttributes(hWnd, 0, 255, LWA_ALPHA);
-            if (!(originalExStyle & WS_EX_LAYERED)) {
-                SetWindowLongPtrW(hWnd, GWL_EXSTYLE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE) & ~WS_EX_LAYERED);
-            }
-            UpdateDwmTransitions(hWnd, TRUE);
-        }
+    if (g_unloading.load(std::memory_order_relaxed) || !IsWindow(hWnd) ||
+        IsIconic(hWnd) || !IsWindowVisible(hWnd)) {
+        const bool retryLater =
+            IsWindow(hWnd) && !IsWindowVisible(hWnd) &&
+            !g_unloading.load(std::memory_order_relaxed);
+        RestorePreparedLaunchWindow(hWnd, originalExStyle, retryLater);
         return 0;
     }
-    StartAnimation(hWnd, TRUE, originalExStyle);
+
+    if (!StartAnimation(hWnd, TRUE, originalExStyle)) {
+        RestorePreparedLaunchWindow(hWnd, originalExStyle, false);
+    }
     return 0;
 }
 static BOOL CALLBACK EnumWindowsInitProc(HWND hWnd, LPARAM lParam) {
@@ -2719,6 +3087,9 @@ BOOL Wh_ModInit() {
     if (g_switchAnimation.load(std::memory_order_relaxed)) {
         StartSwitchThreads();
     }
+    if (g_launchAnimation.load(std::memory_order_relaxed)) {
+        EnsureWinEventThreadStarted();
+    }
     Wh_Log(L"Init ok minimize=%d restore=%d maximize=%d close=%d switch=%d launch=%d explorer=%d",
            g_minimizeAnimation.load(std::memory_order_relaxed),
            g_restoreAnimation.load(std::memory_order_relaxed),
@@ -2759,9 +3130,15 @@ void Wh_ModUninit() {
     std::lock_guard<std::mutex> lock(g_StateMutex);
     for (auto& pair : g_WndSnapshots) DeleteObject(pair.second.hBmp);
     g_WndSnapshots.clear(); g_TaskbarDockXs.clear(); g_ProcessDockXs.clear(); g_ProcessNameCache.clear(); g_LaunchSeen.clear();
-    if (g_hMapFile) {
+    if (g_pSharedState) {
         UnmapViewOfFile(g_pSharedState);
+        g_pSharedState = nullptr;
+    }
+    if (g_hMapFile) {
         CloseHandle(g_hMapFile);
         g_hMapFile = NULL;
     }
+
+    g_sharedStateWritable = false;
+    g_consumedGeneration.store(0, std::memory_order_relaxed);
 }
